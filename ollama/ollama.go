@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/superryanguo/rmcp/llm"
+	. "github.com/superryanguo/rmcp/openai"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,7 @@ const (
 	DefaultEmbeddingModel = "mxbai-embed-large"
 	EmbedUrl              = "/api/embed"
 	DefaultGenModel       = "llama3.2:3b"
+	DefaultGenModel3      = "deepseek-v2:16b"
 	GenUrl                = "/api/generate"
 	DefaultGenModel2      = "deepseek-r1:7b"
 	maxBatch              = 512 // default physical batch size in ollama
@@ -108,22 +110,48 @@ func (c *Client) Prompt(ctx context.Context, input string) ([]byte, error) {
 }
 
 func prompt(ctx context.Context, hc *http.Client, u *url.URL, inputs string, model string) ([]byte, error) {
-	ask := struct {
-		Model  string `json:"model"`
-		Input  string `json:"prompt"`
-		Stream bool   `json:"stream"`
-	}{
-		Model:  model,
-		Input:  inputs,
-		Stream: true,
+	/////////
+	tools := []ToolDefinition{
+		ReadFileDefinition,
+		ListFilesDefinition,
 	}
 
-	erj, err := json.Marshal(ask)
+	openaiTools := []OpenAIChatCompletionTool{}
+	for _, toolDef := range tools {
+		openaiTools = append(openaiTools, OpenAIChatCompletionTool{
+			Type: "function",
+			Function: OpenAIChatCompletionFunctionDefinition{
+				Name:        toolDef.Name,
+				Description: toolDef.Description,
+				Parameters:  toolDef.InputSchema,
+			},
+		})
+	}
+
+	systemPrompt := "You are a helpful Go programmer assistant. You have access to tools to interact with the local filesystem (read, list, edit files). Use them when appropriate to fulfill the user's request. When editing, be precise about the changes. Respond ONLY with tool calls if you need to use tools, otherwise respond with text."
+	conversation := []OpenAIChatCompletionMessage{
+		{Role: "system", Content: systemPrompt}, // Start with system prompt
+	}
+
+	// Build request payload
+	requestPayload := OpenAIChatCompletionRequest{
+		Model:       model,
+		Messages:    conversation,
+		Tools:       openaiTools,
+		ToolChoice:  "auto", // Let the model decide when to use tools
+		MaxTokens:   2048,   // Or make configurable
+		Temperature: 0.7,    // Reasonable default
+	}
+
+	// Marshal payload to JSON
+	jsonPayload, err := json.Marshal(requestPayload)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal request payload: %w", err)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(erj))
+	/////////
+	//request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(erj))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(jsonPayload))
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +168,40 @@ func prompt(ctx context.Context, hc *http.Client, u *url.URL, inputs string, mod
 	if err != nil {
 		return nil, err
 	}
+	fmt.Printf("Gai get rsp1: %s\n", string(rsp))
+
+	ask := struct {
+		Model  string `json:"model"`
+		Input  string `json:"prompt"`
+		Stream bool   `json:"stream"`
+	}{
+		Model:  model,
+		Input:  "what do you see in the directory?",
+		Stream: true,
+	}
+
+	erj, err := json.Marshal(ask)
+	if err != nil {
+		return nil, err
+	}
+	request, err = http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(erj))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+
+	response, err = hc.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+
+	rsp, err = io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("Gai get rsp2: %s\n", string(rsp))
 	return rsp, nil
 }
 
